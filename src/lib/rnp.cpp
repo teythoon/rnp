@@ -1452,11 +1452,11 @@ rnp_import_signatures(rnp_ffi_t ffi, rnp_input_t input, uint32_t flags, char **r
         return RNP_ERROR_BAD_PARAMETERS;
     }
 
-    rnp_result_t ret = RNP_ERROR_GENERIC;
-    json_object *jsores = NULL;
-    json_object *jsosigs = NULL;
-    list         sigs = NULL;
-    rnp_result_t sigret = process_pgp_signatures(&input->src, &sigs);
+    rnp_result_t                 ret = RNP_ERROR_GENERIC;
+    json_object *                jsores = NULL;
+    json_object *                jsosigs = NULL;
+    std::vector<pgp_signature_t> sigs;
+    rnp_result_t                 sigret = process_pgp_signatures(&input->src, sigs);
     if (sigret) {
         ret = sigret;
         FFI_LOG(ffi, "failed to parse signature(s)");
@@ -1474,12 +1474,11 @@ rnp_import_signatures(rnp_ffi_t ffi, rnp_input_t input, uint32_t flags, char **r
         goto done;
     }
 
-    for (list_item *li = list_front(sigs); li; li = list_next(li)) {
+    for (auto &sig : sigs) {
         pgp_sig_import_status_t pub_status = PGP_SIG_IMPORT_STATUS_UNKNOWN;
         pgp_sig_import_status_t sec_status = PGP_SIG_IMPORT_STATUS_UNKNOWN;
-        pgp_signature_t *       sig = (pgp_signature_t *) li;
-        pgp_key_t *pkey = rnp_key_store_import_signature(ffi->pubring, sig, &pub_status);
-        pgp_key_t *skey = rnp_key_store_import_signature(ffi->secring, sig, &sec_status);
+        pgp_key_t *pkey = rnp_key_store_import_signature(ffi->pubring, &sig, &pub_status);
+        pgp_key_t *skey = rnp_key_store_import_signature(ffi->secring, &sig, &sec_status);
         sigret = add_sig_status(jsosigs, pkey ? pkey : skey, pub_status, sec_status);
         if (sigret) {
             ret = sigret;
@@ -1501,7 +1500,6 @@ rnp_import_signatures(rnp_ffi_t ffi, rnp_input_t input, uint32_t flags, char **r
     }
     ret = RNP_SUCCESS;
 done:
-    signature_list_destroy(&sigs);
     json_object_put(jsores);
     return ret;
 }
@@ -2650,34 +2648,37 @@ rnp_op_sign_destroy(rnp_op_sign_t op)
 static void
 rnp_op_verify_on_signatures(const std::vector<pgp_signature_info_t> &sigs, void *param)
 {
-    struct rnp_op_verify_signature_st res;
-    rnp_op_verify_t                   op = (rnp_op_verify_t) param;
+    rnp_op_verify_t op = (rnp_op_verify_t) param;
 
-    op->signatures = (rnp_op_verify_signature_t) calloc(sigs.size(), sizeof(*op->signatures));
-    if (!op->signatures) {
-        FFI_LOG(op->ffi, "Allocation error");
+    try {
+        op->signatures = new rnp_op_verify_signature_st[sigs.size()];
+    } catch (const std::exception &e) {
+        FFI_LOG(op->ffi, "%s", e.what());
         return;
     }
     op->signature_count = sigs.size();
 
     size_t i = 0;
     for (const auto &sinfo : sigs) {
-        memset(&res, 0, sizeof(res));
-
-        /* ignore copy result - NULL signature on out of memory error will work for us */
-        (void) copy_signature_packet(&res.sig_pkt, sinfo.sig);
-
-        if (sinfo.unknown) {
-            res.verify_status = RNP_ERROR_SIGNATURE_INVALID;
-        } else if (sinfo.valid) {
-            res.verify_status = sinfo.expired ? RNP_ERROR_SIGNATURE_EXPIRED : RNP_SUCCESS;
-        } else {
-            res.verify_status =
-              sinfo.no_signer ? RNP_ERROR_KEY_NOT_FOUND : RNP_ERROR_SIGNATURE_INVALID;
+        rnp_op_verify_signature_t res = &op->signatures[i++];
+        /* sinfo.sig may be NULL */
+        if (sinfo.sig) {
+            try {
+                res->sig_pkt = *sinfo.sig;
+            } catch (const std::exception &e) {
+                FFI_LOG(op->ffi, "%s", e.what());
+            }
         }
 
-        res.ffi = op->ffi;
-        op->signatures[i++] = res;
+        if (sinfo.unknown) {
+            res->verify_status = RNP_ERROR_SIGNATURE_INVALID;
+        } else if (sinfo.valid) {
+            res->verify_status = sinfo.expired ? RNP_ERROR_SIGNATURE_EXPIRED : RNP_SUCCESS;
+        } else {
+            res->verify_status =
+              sinfo.no_signer ? RNP_ERROR_KEY_NOT_FOUND : RNP_ERROR_SIGNATURE_INVALID;
+        }
+        res->ffi = op->ffi;
     }
 }
 
@@ -3118,10 +3119,7 @@ rnp_op_verify_destroy(rnp_op_verify_t op)
 {
     if (op) {
         rnp_ctx_free(&op->rnpctx);
-        for (size_t i = 0; i < op->signature_count; i++) {
-            free_signature(&op->signatures[i].sig_pkt);
-        }
-        free(op->signatures);
+        delete[] op->signatures;
         free(op->filename);
         free(op->recipients);
         free(op->used_recipient);
@@ -3157,15 +3155,11 @@ rnp_op_verify_signature_get_handle(rnp_op_verify_signature_t sig,
     pgp_subsig_t *subsig = NULL;
     try {
         subsig = new pgp_subsig_t();
+        subsig->sig = sig->sig_pkt;
     } catch (const std::exception &e) {
         FFI_LOG(sig->ffi, "%s", e.what());
-        free(*handle);
-        return RNP_ERROR_OUT_OF_MEMORY;
-    }
-    if (!copy_signature_packet(&subsig->sig, &sig->sig_pkt)) {
         delete subsig;
         free(*handle);
-        *handle = NULL;
         return RNP_ERROR_OUT_OF_MEMORY;
     }
     (*handle)->sig = subsig;
@@ -3696,8 +3690,7 @@ rnp_key_export_revocation(rnp_key_handle_t key,
     ret = stream_write_signature(sig, &output->dst) ? RNP_SUCCESS : RNP_ERROR_WRITE;
     dst_flush(&output->dst);
     output->keep = !ret;
-    free_signature(sig);
-    free(sig);
+    delete sig;
     return ret;
 }
 
@@ -3736,8 +3729,7 @@ rnp_key_revoke(
     if (key->sec) {
         sec_status = rnp_key_store_import_key_signature(key->ffi->secring, key->sec, sig);
     }
-    free_signature(sig);
-    free(sig);
+    delete sig;
 
     if ((pub_status == PGP_SIG_IMPORT_STATUS_UNKNOWN) ||
         (sec_status == PGP_SIG_IMPORT_STATUS_UNKNOWN)) {
